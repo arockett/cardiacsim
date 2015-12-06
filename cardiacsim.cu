@@ -76,13 +76,13 @@ extern "C" {
 void cmdLine(int argc, char *argv[], double& T, int& n, int& px, int& py, int& plot_freq, int& no_comm, int&num_threads);
 
 __device__
-int pos(const int j, const int i, const int m, const int n)
+int pos(int j, int i, int m, int n)
 {
     return j*n + i;
 }
 
 __global__
-void copyGhostRegion(double* Eprev, const int m, const int n)
+void copyGhostRegion(double* Eprev, int m, int n)
 {
     int leftTo = pos(threadIdx.x+1, 0, m, n);
     int leftFrom = pos(threadIdx.x+1, 2, m, n);
@@ -102,9 +102,37 @@ void copyGhostRegion(double* Eprev, const int m, const int n)
 }
 
 __global__
-void PDE(double* E, double* Eprev, const double alpha, const int m, const int n)
+void PDE(double* E, double* Eprev, double alpha, int m, int n)
 {
+    int row = blockIdx.y*blockDim.y + threadIdx.y;
+    int col = blockIdx.x*blockDim.x + threadIdx.x;
+    int target = pos(row, col, m, n);
+    int right = pos(row, col+1, m, n);
+    int left = pos(row, col-1, m, n);
+    int up = pos(row-1, col, m, n);
+    int down = pos(row+1, col, m, n);
     
+    E[target] = Eprev[target] + alpha*(Eprev[right]+Eprev[left]-4*Eprev[target]+Eprev[up]+Eprev[down]);
+}
+
+__global__
+void ODE_excitation(double* E, double* R, double dt, double kk, double a, int m, int n)
+{
+    int row = blockIdx.y*blockDim.y + threadIdx.y;
+    int col = blockIdx.x*blockDim.x + threadIdx.x;
+    int target = pos(row, col, m, n);
+
+    E[target] = E[target] - dt*(kk*E[target]*(E[target]-a)*(E[target]-1) + E[target]*R[target]);
+}
+
+__global__
+void ODE_recovery(double* E, double* R, double dt, double epsilon, double M1, double M2, double kk, double b, int m, int n)
+{
+    int row = blockIdx.y*blockDim.y + threadIdx.y;
+    int col = blockIdx.x*blockDim.x + threadIdx.x;
+    int target = pos(row, col, m, n);
+
+    R[target] = R[target] + dt*(epsilon + M1*R[target]/(E[target] + M2)) * (-R[target] - kk*E[target]*(E[target] - b - 1));
 }
 
 void simulate (double** E,  double** E_prev,double** R,
@@ -120,13 +148,24 @@ void simulate (double** E,  double** E_prev,double** R,
      * on the boundary of the computational box
      * Using mirror boundaries
      */
+    int size = sizeof(double)*(m+2)*(n+2);
+    cudaMemcpy(d_Eprev, (double*)E_prev+(m+2), size, cudaMemcpyHostToDevice);
     dim3 ghostBlock(128, 1, 1);
     dim3 ghostGrid(m/ghostBlock.x, 1);
 
     copyGhostRegion<<< ghostGrid, ghostBlock >>>(d_Eprev, m, n);
 
-    cudaMemcpy(E_prev+(m+2), d_Eprev, sizeof(double)*(m+2)*(n+2), cudaMemcpyDeviceToHost);
+    cudaThreadSynchronize();
+    cudaMemcpy((double*)E_prev+(m+2), d_Eprev, size, cudaMemcpyDeviceToHost);
+/*
+    int ntx = 16, nty = 16;
+    dim3 tblock(ntx, nty, 1);
+    dim3 grid(n/tblock.x, m/tblock.y);
 
+    PDE<<< grid, tblock >>>(d_E, d_Eprev, alpha, m, n);
+    ODE_excitation<<< grid, tblock >>>(d_E, d_R, dt, kk, a, m, n);
+    ODE_recovery<<< grid, tblock >>>(d_E, d_R, dt, epsilon, M1, M2, kk, b, m, n);
+*/
     // Solve for the excitation, the PDE
     for (j=1; j<=m; j++){
       for (i=1; i<=n; i++) {
@@ -228,11 +267,11 @@ int main (int argc, char** argv)
   double *d_E, *d_Eprev, *d_R;
 
   cudaMalloc((void**) &d_E, size);
-  cudaMemcpy(d_E, E+(m+2), size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_E, (double*)E+(m+2), size, cudaMemcpyHostToDevice);
   cudaMalloc((void**) &d_Eprev, size);
-  cudaMemcpy(d_Eprev, E_prev+(m+2), size, cudaMemcpyHostToDevice);
+  //cudaMemcpy(d_Eprev, (double*)E_prev+(m+2), size, cudaMemcpyHostToDevice);
   cudaMalloc((void**) &d_R, size);
-  cudaMemcpy(d_R, R+(m+2), size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_R, (double*)R+(m+2), size, cudaMemcpyHostToDevice);
 
   while (t<T) {
     
@@ -247,7 +286,7 @@ int main (int argc, char** argv)
     if (plot_freq){
       int k = (int)(t/plot_freq);
       if ((t - k * plot_freq) < dt){
-    //cudaMemcpy(E+(m+2), d_E, size, cudaMemcpyDeviceToHost);
+    //cudaMemcpy((double*)E+(m+2), d_E, size, cudaMemcpyDeviceToHost);
     
 	splot(E,t,niter,m+2,n+2);
       }
@@ -265,7 +304,7 @@ int main (int argc, char** argv)
   cout << "Sustained Bandwidth (GB/sec): " << BW << endl << endl; 
 
   double mx;
-  cudaMemcpy(E_prev+(m+2), d_Eprev, size, cudaMemcpyDeviceToHost);
+  //cudaMemcpy((double*)E_prev+(m+2), d_Eprev, size, cudaMemcpyDeviceToHost);
   double l2norm = stats(E_prev,m,n,&mx);
   cout << "Max: " << mx <<  " L2norm: "<< l2norm << endl;
 
